@@ -6,10 +6,16 @@ import {
   resolveRef,
   abortMerge,
   add,
+  listFiles,
   STAGE,
   TREE,
   WORKDIR,
   walk,
+  init,
+  commit,
+  branch,
+  checkout,
+  statusMatrix,
 } from 'isomorphic-git'
 import { GitIndexManager, modified } from 'isomorphic-git/internal-apis'
 
@@ -501,5 +507,102 @@ describe('abortMerge', () => {
     expect(fileAContent).toEqual(fileAHeadVersion)
     expect(fileBContent).toEqual(fileBHeadVersion)
     expect(fileCContent).toEqual('new text for file c')
+  })
+
+  it('drops files added to the index during the merge', async () => {
+    const { fs, gitdir, dir } = await makeFixtureAsSubmodule('test-abortMerge')
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: -0,
+    }
+    let error = null
+    try {
+      await merge({
+        fs,
+        dir,
+        gitdir,
+        ours: 'a',
+        theirs: 'b',
+        abortOnConflict: false,
+        author,
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(error.code).toBe(Errors.MergeConflictError.code)
+
+    // A file staged during the merge, and one left only in the index.
+    await fs.write(`${dir}/added`, 'added during the merge')
+    await add({ fs, dir, gitdir, filepath: 'added' })
+    await fs.write(`${dir}/index-only`, 'only in the index')
+    await add({ fs, dir, gitdir, filepath: 'index-only' })
+    await fs.rm(`${dir}/index-only`)
+
+    await abortMerge({ fs, dir, gitdir })
+
+    expect(await fs.exists(`${dir}/added`)).toBe(false)
+    expect(await listFiles({ fs, dir, gitdir })).toEqual(['a', 'b', 'c'])
+    expect(await fs.read(`${dir}/a`, 'utf8')).not.toContain('<<<<<<<')
+  })
+  it('restores executable files with their mode', async () => {
+    const { fs, gitdir, gitdirsmfullpath, dir } =
+      await makeFixtureAsSubmodule('tmp-abort-exec')
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: -0,
+    }
+    await init({ fs, dir, gitdir })
+    await fs.write(`${dir}/c.txt`, '1\n2\n3\n')
+    await fs.write(`${dir}/run.sh`, 'a\n', { mode: 0o777 })
+    await fs.write(`${dir}/mode.sh`, 'm\n', { mode: 0o777 })
+    await add({ fs, dir, gitdir, filepath: '.' })
+    await commit({ fs, dir, gitdir, message: 'base', author })
+    await branch({ fs, dir, gitdir, ref: 'feature', checkout: true })
+    await fs.write(`${dir}/c.txt`, '1\nfeature\n3\n')
+    await fs.rm(`${dir}/run.sh`)
+    await fs.write(`${dir}/run.sh`, 'b\n', { mode: 0o777 })
+    // feature also makes mode.sh a plain file
+    await fs.rm(`${dir}/mode.sh`)
+    await fs.write(`${dir}/mode.sh`, 'm\n')
+    await add({ fs, dir, gitdir, filepath: '.' })
+    await commit({ fs, dir, gitdir, message: 'feature', author })
+    await checkout({ fs, dir, gitdir, ref: 'master' })
+    await fs.write(`${dir}/c.txt`, '1\nmaster\n3\n')
+    await add({ fs, dir, gitdir, filepath: 'c.txt' })
+    await commit({ fs, dir, gitdir, message: 'master', author })
+    let error = null
+    try {
+      await merge({
+        fs,
+        dir,
+        gitdir,
+        theirs: 'feature',
+        abortOnConflict: false,
+        author,
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(error.code).toBe(Errors.MergeConflictError.code)
+
+    await abortMerge({ fs, dir, gitdir })
+
+    // Read before statusMatrix, which refreshes index entries from disk:
+    // the index itself must have the modes.
+    const modes = await GitIndexManager.acquire(
+      { fs, gitdir: gitdirsmfullpath, cache: {} },
+      async index => ({
+        run: index.entriesMap.get('run.sh').mode,
+        mode: index.entriesMap.get('mode.sh').mode,
+      })
+    )
+    expect(modes).toEqual({ run: 0o100755, mode: 0o100755 })
+    expect(await fs.read(`${dir}/run.sh`, 'utf8')).toBe('a\n')
+    const matrix = await statusMatrix({ fs, dir, gitdir })
+    expect(matrix.every(row => row.slice(1).join() === '1,1,1')).toBe(true)
   })
 })

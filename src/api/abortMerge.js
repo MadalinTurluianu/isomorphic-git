@@ -21,8 +21,7 @@ import { modified } from '../utils/modified.js'
  * Essentially, abortMerge will reset any files affected by merge conflicts to their last known good version at HEAD.
  * Any unstaged changes are saved and any staged changes are reset as well.
  *
- * NOTE: The behavior of this command differs slightly from canonical git in that an error will be thrown if a file exists in the index and nowhere else.
- * Canonical git will reset the file and continue aborting the merge in this case.
+ * Like `git merge --abort`, it removes files that were added to the index by or during the merge, and refuses with an `IndexResetError` to touch a file that was staged and then modified again.
  *
  * **WARNING:** Running git merge with non-trivial uncommitted changes is discouraged: while possible, it may leave you in a state that is hard to back out of in the case of a conflict.
  * If there were uncommitted changes when the merge started (and especially if those changes were further modified after the merge was started), `git.abortMerge` will in some cases be unable to reconstruct the original (pre-merge) changes.
@@ -73,16 +72,22 @@ export async function abortMerge({
         const unmodified = !(await modified(index, head))
 
         if (staged || unmerged) {
-          return head
-            ? {
-                path,
-                mode: await head.mode(),
-                oid: await head.oid(),
-                type: await head.type(),
-                content: await head.content(),
-              }
-            : undefined
+          if (head) {
+            return {
+              path,
+              mode: await head.mode(),
+              oid: await head.oid(),
+              type: await head.type(),
+              content: await head.content(),
+            }
+          }
+          // Added by the merge or staged during it: git drops it. A directory
+          // is handled through the files in it.
+          if (workdir && (await workdir.type()) === 'tree') return
+          return { path, type: 'delete' }
         }
+        // Only in the index: git drops it and carries on.
+        if (!head && !workdir) return { path, type: 'delete' }
 
         if (unmodified) return false
         else throw new IndexResetError(path)
@@ -98,23 +103,30 @@ export async function abortMerge({
         for (const entry of results) {
           if (entry === false) continue
 
-          // entry is not false, so from here we can assume index = workdir
-          if (!entry) {
-            await fs.rmdir(`${dir}/${entry.path}`, { recursive: true })
+          if (entry.type === 'delete') {
+            await fs.rm(`${dir}/${entry.path}`)
             index.delete({ filepath: entry.path })
             continue
           }
 
           if (entry.type === 'blob') {
-            const content = new TextDecoder().decode(entry.content)
-            await fs.write(`${dir}/${entry.path}`, content, {
-              mode: entry.mode,
-            })
-            index.insert({
-              filepath: entry.path,
-              oid: entry.oid,
-              stage: 0,
-            })
+            // Written the way checkout writes files: a fresh file, so that
+            // its mode is right, and a symlink as a link.
+            const fullpath = `${dir}/${entry.path}`
+            await fs.rm(fullpath)
+            if (entry.mode === 0o120000) {
+              await fs.writelink(fullpath, Buffer.from(entry.content))
+            } else {
+              await fs.write(
+                fullpath,
+                entry.content,
+                entry.mode === 0o100755 ? { mode: 0o777 } : {}
+              )
+            }
+            const stats = await fs.lstat(fullpath)
+            // The executable bit from lstat cannot be trusted on Windows.
+            if (entry.mode === 0o100755) stats.mode = 0o755
+            index.insert({ filepath: entry.path, stats, oid: entry.oid })
           }
         }
       }
