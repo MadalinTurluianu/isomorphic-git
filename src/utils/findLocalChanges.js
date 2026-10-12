@@ -30,6 +30,8 @@ import { worthWalking } from './worthWalking.js'
  * @param {string} args.headTree
  * @param {string} args.baseTree
  * @param {string} args.theirTree
+ * @param {string[]} [args.ignored] - receives the ignored untracked files that
+ * writing the merge would overwrite, for callers that remove them first
  *
  * @returns {Promise<string[]>}
  */
@@ -41,6 +43,7 @@ export async function findLocalChanges({
   headTree,
   baseTree,
   theirTree,
+  ignored,
 }) {
   // Unmerged paths mean a previous merge is still unresolved. An empty index
   // means nothing was checked out yet, so nothing is staged either.
@@ -120,9 +123,13 @@ export async function findLocalChanges({
       const headOid =
         head && (await head.type()) === 'blob' ? await head.oid() : undefined
       // Like git, an untracked file that .gitignore ignores may be overwritten.
-      const expendable = async () =>
-        (await workdir.type()) === 'blob' &&
-        GitIgnoreManager.isIgnored({ fs, dir, gitdir, filepath })
+      const expendable = async () => {
+        const yes =
+          (await workdir.type()) === 'blob' &&
+          (await GitIgnoreManager.isIgnored({ fs, dir, gitdir, filepath }))
+        if (yes && ignored) ignored.push(filepath)
+        return yes
+      }
       // A tracked directory where the merge wants a file is judged through
       // the files inside it.
       if (

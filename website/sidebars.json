@@ -13,6 +13,9 @@
       "fastForward",
       "merge",
       "abortMerge",
+      "rebase",
+      "continueRebase",
+      "abortRebase",
       "walk",
       "stash"
     ],
