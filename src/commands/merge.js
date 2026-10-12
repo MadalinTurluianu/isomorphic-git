@@ -12,6 +12,7 @@ import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { abbreviateRef } from '../utils/abbreviateRef.js'
 import { findLocalChanges } from '../utils/findLocalChanges.js'
+import { formatMergeMessage } from '../utils/mergeState.js'
 import { mergeTree } from '../utils/mergeTree.js'
 import { resolveCommit } from '../utils/resolveCommit.js'
 
@@ -128,6 +129,7 @@ export async function _merge({
   }
   if (fastForward && baseOid === ourOid) {
     if (!dryRun && !noUpdateBranch) {
+      await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
       await GitRefManager.writeRef({ fs, gitdir, ref: ours, value: theirOid })
     }
     return {
@@ -177,14 +179,26 @@ export async function _merge({
       }
     )
 
+    if (!message) message = defaultMessage(ours, theirs)
+
     // Defer throwing error until the index lock is relinquished and index is
     // written to filesystem
-    if (tree instanceof MergeConflictError) throw tree
+    if (tree instanceof MergeConflictError) {
+      if (!abortOnConflict && !dryRun) {
+        // Record the merge in progress the way git does, so `commit` (or
+        // `git commit`) finishes it and `abortMerge` can undo it.
+        await fs.write(`${gitdir}/MERGE_HEAD`, `${theirOid}\n`)
+        await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
+        await fs.write(
+          `${gitdir}/MERGE_MSG`,
+          formatMergeMessage(message, tree.data.filepaths)
+        )
+      }
+      throw tree
+    }
 
-    if (!message) {
-      message = `Merge branch '${abbreviateRef(theirs)}' into ${abbreviateRef(
-        ours
-      )}`
+    if (!dryRun && !noUpdateBranch) {
+      await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
     }
     const oid = await _commit({
       fs,
@@ -206,5 +220,27 @@ export async function _merge({
       tree,
       mergeCommit: true,
     }
+  }
+}
+
+// The title git gives a merge commit: "into <branch>" is left out when
+// merging into main or master.
+function defaultMessage(ours, theirs) {
+  const kind = theirs.startsWith('refs/tags/')
+    ? 'tag'
+    : theirs.startsWith('refs/remotes/')
+      ? 'remote-tracking branch'
+      : 'branch'
+  const into = ['main', 'master'].includes(abbreviateRef(ours))
+    ? ''
+    : ` into ${abbreviateRef(ours)}`
+  return `Merge ${kind} '${abbreviateRef(theirs)}'${into}`
+}
+
+// Like git, remember where the checked-out branch was before a merge moves
+// it, so that `git reset --hard ORIG_HEAD` undoes the merge.
+async function writeOrigHead({ fs, gitdir, ours, oid }) {
+  if (ours === (await _currentBranch({ fs, gitdir, fullname: true }))) {
+    await fs.write(`${gitdir}/ORIG_HEAD`, `${oid}\n`)
   }
 }

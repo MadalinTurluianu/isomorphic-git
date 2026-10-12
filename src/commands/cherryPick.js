@@ -10,6 +10,7 @@ import { MergeConflictError } from '../errors/MergeConflictError.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { findLocalChanges } from '../utils/findLocalChanges.js'
+import { formatMergeMessage } from '../utils/mergeState.js'
 import { applyMergedTree, mergeTree } from '../utils/mergeTree.js'
 
 /**
@@ -131,6 +132,15 @@ export async function _cherryPick({
   )
 
   if (mergedTreeOid instanceof MergeConflictError) {
+    if (!abortOnConflict && !dryRun) {
+      // Record the cherry-pick in progress the way git does, so `commit` (or
+      // `git commit`) finishes it with the picked commit's author and message.
+      await fs.write(`${gitdir}/CHERRY_PICK_HEAD`, `${cherryOid}\n`)
+      await fs.write(
+        `${gitdir}/MERGE_MSG`,
+        formatMergeMessage(cherryCommit.message, mergedTreeOid.data.filepaths)
+      )
+    }
     throw mergedTreeOid
   }
 

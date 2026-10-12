@@ -1096,4 +1096,83 @@ describe('cherryPick in submodule', () => {
     expect(error).not.toBeNull()
     expect(error.code).toBe(Errors.MissingNameError.code)
   })
+
+  it('records the cherry-pick in progress so commit keeps author and message', async () => {
+    const { fs, dir, gitdir, gitdirsmfullpath } =
+      await makeFixtureAsSubmodule('tmp-cherry-state')
+    await init({ fs, dir, gitdir })
+    const author = {
+      name: 'Original Author',
+      email: 'original@example.com',
+      timestamp: 1600000000,
+      timezoneOffset: 0,
+    }
+    const committer = {
+      name: 'Committer',
+      email: 'committer@example.com',
+      timestamp: 1700000000,
+      timezoneOffset: 0,
+    }
+    await fs.write(join(dir, 'file.txt'), 'base\n')
+    await add({ fs, dir, gitdir, filepath: 'file.txt' })
+    await gitCommit({ fs, dir, gitdir, message: 'base', author: committer })
+    await branch({ fs, dir, gitdir, ref: 'feature', checkout: true })
+    await fs.write(join(dir, 'file.txt'), 'feature\n')
+    await add({ fs, dir, gitdir, filepath: 'file.txt' })
+    const featureOid = await gitCommit({
+      fs,
+      dir,
+      gitdir,
+      message: 'Feature subject\n\nFeature body.\n',
+      author,
+    })
+    await checkout({ fs, dir, gitdir, ref: 'master' })
+    await fs.write(join(dir, 'file.txt'), 'master\n')
+    await add({ fs, dir, gitdir, filepath: 'file.txt' })
+    const masterOid = await gitCommit({
+      fs,
+      dir,
+      gitdir,
+      message: 'master',
+      author: committer,
+    })
+
+    let error = null
+    try {
+      await cherryPick({
+        fs,
+        dir,
+        gitdir,
+        oid: featureOid,
+        committer,
+        abortOnConflict: false,
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(error.code).toBe(Errors.MergeConflictError.code)
+    expect(await fs.read(`${gitdirsmfullpath}/CHERRY_PICK_HEAD`, 'utf8')).toBe(
+      `${featureOid}\n`
+    )
+    expect(await fs.read(`${gitdirsmfullpath}/MERGE_MSG`, 'utf8')).toBe(
+      'Feature subject\n\nFeature body.\n\n# Conflicts:\n#\tfile.txt\n'
+    )
+    expect(await fs.read(join(dir, 'file.txt'), 'utf8')).toBe(
+      `<<<<<<< HEAD\nmaster\n=======\nfeature\n>>>>>>> ${featureOid.slice(
+        0,
+        7
+      )} (Feature subject)\n`
+    )
+
+    await fs.write(join(dir, 'file.txt'), 'resolved\n')
+    await add({ fs, dir, gitdir, filepath: 'file.txt' })
+    const oid = await gitCommit({ fs, dir, gitdir, committer })
+    const { commit } = await readCommit({ fs, gitdir, oid })
+    expect(commit.parent).toEqual([masterOid])
+    expect(commit.message).toBe('Feature subject\n\nFeature body.\n')
+    expect(commit.author).toEqual(author)
+    expect(commit.committer).toEqual(committer)
+    expect(await fs.exists(`${gitdirsmfullpath}/CHERRY_PICK_HEAD`)).toBe(false)
+    expect(await fs.exists(`${gitdirsmfullpath}/MERGE_MSG`)).toBe(false)
+  })
 })

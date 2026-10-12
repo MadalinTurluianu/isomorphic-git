@@ -15,6 +15,7 @@ import { hasObject } from '../storage/hasObject.js'
 import { _readObject as readObject } from '../storage/readObject.js'
 import { _writeObject as writeObject } from '../storage/writeObject.js'
 import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
+import { clearMergeState, stripConflictsComment } from '../utils/mergeState.js'
 import { normalizeAuthorObject } from '../utils/normalizeAuthorObject.js'
 import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
 
@@ -71,15 +72,41 @@ export async function _commit({
   // Determine ref and the commit pointed to by ref, and if it is the initial commit
   let initialCommit = false
   let detachedHead = false
+  const headRef = await GitRefManager.resolve({
+    fs,
+    gitdir,
+    ref: 'HEAD',
+    depth: 2,
+  })
   if (!ref) {
     const headContent = await fs.read(`${gitdir}/HEAD`, { encoding: 'utf8' })
     detachedHead = !headContent.startsWith('ref:')
-    ref = await GitRefManager.resolve({
-      fs,
-      gitdir,
-      ref: 'HEAD',
-      depth: 2,
-    })
+    ref = headRef
+  }
+
+  // A merge or cherry-pick that stopped on conflicts is finished by the next
+  // commit on HEAD, like `git commit` does: its other parents come from
+  // MERGE_HEAD, its message from MERGE_MSG, and a cherry-pick keeps the picked
+  // commit's author.
+  const onHead = ref === headRef || `refs/heads/${ref}` === headRef
+  const readState = async file =>
+    /** @type {string|null} */ (
+      await fs.read(`${gitdir}/${file}`, { encoding: 'utf8' })
+    )
+  const mergeHead = onHead && !amend ? await readState('MERGE_HEAD') : null
+  const cherryPickHead =
+    onHead && !amend ? await readState('CHERRY_PICK_HEAD') : null
+  const pickedCommit = cherryPickHead
+    ? (await readCommit({ fs, gitdir, oid: cherryPickHead.trim(), cache }))
+        .commit
+    : undefined
+  // MERGE_MSG supplies the default message, without the conflict list that
+  // was appended to it as comments.
+  if (!message && !amend) {
+    const mergeMsg =
+      (mergeHead || cherryPickHead) && (await readState('MERGE_MSG'))
+    if (mergeMsg) message = stripConflictsComment(mergeMsg)
+    if (!message) throw new MissingParameterError('message')
   }
 
   let refOid, refCommit
@@ -104,7 +131,12 @@ export async function _commit({
 
   // Determine author and committer information
   const author = !amend
-    ? await normalizeAuthorObject({ fs, gitdir, author: _author })
+    ? await normalizeAuthorObject({
+        fs,
+        gitdir,
+        author: _author,
+        commit: pickedCommit,
+      })
     : await normalizeAuthorObject({
         fs,
         gitdir,
@@ -113,11 +145,13 @@ export async function _commit({
       })
   if (!author) throw new MissingNameError('author')
 
+  // Whoever commits is the committer, as in git: the committer defaults to
+  // the author the caller gave, never to the one taken from a picked commit.
   const committer = !amend
     ? await normalizeCommitterObject({
         fs,
         gitdir,
-        author,
+        author: pickedCommit ? _author : author,
         committer: _committer,
       })
     : await normalizeCommitterObject({
@@ -142,6 +176,7 @@ export async function _commit({
       if (!parent) {
         if (!amend) {
           parent = refOid ? [refOid] : []
+          if (mergeHead) parent.push(...mergeHead.split('\n').filter(Boolean))
         } else {
           parent = refCommit.commit.parent
         }
@@ -180,12 +215,8 @@ export async function _commit({
       }
 
       // Determine message of this commit
-      if (!message) {
-        if (!amend) {
-          throw new MissingParameterError('message')
-        } else {
-          message = refCommit.commit.message
-        }
+      if (!message && amend) {
+        message = refCommit.commit.message
       }
 
       // Create and write new Commit object
@@ -214,6 +245,7 @@ export async function _commit({
           ref: detachedHead ? 'HEAD' : ref,
           value: oid,
         })
+        if (onHead) await clearMergeState({ fs, gitdir })
       }
       return oid
     }

@@ -28,9 +28,9 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  *
  * Currently it does not support selecting alternative merge strategies.
  *
- * Currently it is not possible to abort an incomplete merge. To restore the worktree to a clean state, you will need to checkout an earlier commit.
+ * An incomplete merge can be aborted with [abortMerge](./abortMerge.md).
  *
- * Currently it does not directly support the behavior of `git merge --continue`. To complete a merge after manual conflict resolution, you will need to add and commit the files manually, and specify the appropriate parent commits.
+ * To complete a merge after manual conflict resolution, add the files and [commit](./commit.md): the merge parents and message are taken from `MERGE_HEAD` and `MERGE_MSG`, like `git commit` does.
  *
  * ## Manually resolving merge conflicts
  * By default, if isomorphic-git encounters a merge conflict it cannot resolve using the builtin diff3 algorithm or provided merge driver, it will abort and throw a `MergeNotSupportedError`.
@@ -40,6 +40,8 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  * files the merge changed are updated and staged, files with unresolved conflicts contain conflict markers and are recorded in the index with their base, ours and theirs versions, and files the merge does not touch are left alone.
  * Binary files are never merged: ours is kept in the working directory and the conflict is recorded in the index.
  *
+ * The merge in progress is recorded in `MERGE_HEAD`, `MERGE_MSG` and `ORIG_HEAD`, so git itself, editors and [commit](./commit.md) can finish or abort it.
+ *
  * Like `git merge`, this refuses to start when writing the result would overwrite local changes: any staged change, an unstaged edit to a file the merge changes, or an untracked file in its way.
  * Untracked files that `.gitignore` ignores are not in the way: like git, the merge overwrites them.
  * A `MergeLocalChangesError` listing those files is thrown before anything is written.
@@ -47,7 +49,6 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  *
  * To complete the merge, edit the conflicting files as you see fit, and then add and commit the resolved merge.
  *
- * For a proper merge commit, be sure to specify the branches or commits you are merging in the `parent` argument to `git.commit`.
  * For example, say we are merging the branch `feature` into the branch `main` and there is a conflict we want to resolve manually.
  * The flow would look like this:
  *
@@ -78,12 +79,11 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  *   filepath: '.',
  * })
  *
+ * // The merge commit gets both parents and the message "Merge branch 'feature'"
+ * // from MERGE_HEAD and MERGE_MSG; pass `parent` and `message` to override them.
  * await git.commit({
  *   fs,
  *   dir,
- *   ref: 'main',
- *   message: "Merge branch 'feature' into main",
- *   parent: ['main', 'feature'], // Be sure to specify the parents when creating a merge commit
  * })
  * ```
  *
@@ -99,7 +99,7 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  * @param {boolean} [args.dryRun = false] - If true, simulates a merge so you can test whether it would succeed.
  * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
  * @param {boolean} [args.abortOnConflict = true] - If true, merges with conflicts will not update the worktree or index.
- * @param {string} [args.message] - Overrides the default auto-generated merge commit message
+ * @param {string} [args.message] - Overrides the default auto-generated merge commit message (`Merge branch 'feature'` when merging into main or master, `Merge branch 'feature' into other` otherwise, like git)
  * @param {Object} [args.author] - passed to [commit](commit.md) when creating a merge commit
  * @param {string} [args.author.name] - Default is `user.name` config.
  * @param {string} [args.author.email] - Default is `user.email` config.

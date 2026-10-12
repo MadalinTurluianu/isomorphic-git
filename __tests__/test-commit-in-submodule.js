@@ -11,6 +11,7 @@ import {
   add,
   annotatedTag,
   writeTag,
+  setConfig,
 } from 'isomorphic-git'
 
 import { makeFixtureAsSubmodule } from './__helpers__/FixtureFSSubmodule.js'
@@ -601,5 +602,111 @@ describe('commit', () => {
     }
     expect(error).not.toBeNull()
     expect(error instanceof Errors.NoCommitError).toBe(true)
+  })
+
+  it('finishes a merge recorded in MERGE_HEAD and MERGE_MSG', async () => {
+    const { fs, dir, gitdir, gitdirsmfullpath } = await makeFixtureAsSubmodule(
+      'tmp-commit-merge-head'
+    )
+    await init({ fs, dir, gitdir })
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: 0,
+    }
+    await fs.write(`${dir}/a.txt`, 'a')
+    await add({ fs, dir, gitdir, filepath: 'a.txt' })
+    const first = await commit({ fs, dir, gitdir, message: 'first', author })
+    const other = await commit({
+      fs,
+      dir,
+      gitdir,
+      message: 'other',
+      author,
+      parent: [],
+      ref: 'refs/heads/other',
+    })
+    await fs.write(`${gitdirsmfullpath}/MERGE_HEAD`, `${other}\n`)
+    await fs.write(
+      `${gitdirsmfullpath}/MERGE_MSG`,
+      'Merge it\n\n# Conflicts:\n#\ta.txt\n'
+    )
+
+    // A commit on another branch leaves the merge alone.
+    let error = null
+    try {
+      await commit({ fs, dir, gitdir, author, ref: 'refs/heads/other' })
+    } catch (e) {
+      error = e
+    }
+    expect(error.code).toBe(Errors.MissingParameterError.code)
+
+    const oid = await commit({ fs, dir, gitdir, author })
+    const { commit: merged } = await readCommit({ fs, gitdir, oid })
+    expect(merged.parent).toEqual([first, other])
+    expect(merged.message).toBe('Merge it\n')
+    expect(await resolveRef({ fs, gitdir, ref: 'master' })).toBe(oid)
+    expect(await fs.exists(`${gitdirsmfullpath}/MERGE_HEAD`)).toBe(false)
+    expect(await fs.exists(`${gitdirsmfullpath}/MERGE_MSG`)).toBe(false)
+  })
+
+  it('finishes a cherry-pick recorded in CHERRY_PICK_HEAD and MERGE_MSG', async () => {
+    const { fs, dir, gitdir, gitdirsmfullpath } = await makeFixtureAsSubmodule(
+      'tmp-commit-cherry-pick-head'
+    )
+    await init({ fs, dir, gitdir })
+    await setConfig({ fs, dir, gitdir, path: 'user.name', value: 'Committer' })
+    await setConfig({
+      fs,
+      dir,
+      gitdir,
+      path: 'user.email',
+      value: 'committer@example.com',
+    })
+    const original = {
+      name: 'Original Author',
+      email: 'original@example.com',
+      timestamp: 1600000000,
+      timezoneOffset: 0,
+    }
+    await fs.write(`${dir}/a.txt`, 'a')
+    await add({ fs, dir, gitdir, filepath: 'a.txt' })
+    const first = await commit({
+      fs,
+      dir,
+      gitdir,
+      message: 'first',
+      author: original,
+    })
+    // The picked commit's message has lines that look like comments.
+    const message = '#42 subject\n\n# not a comment\nbody\n'
+    const picked = await commit({
+      fs,
+      dir,
+      gitdir,
+      message,
+      author: original,
+      parent: [first],
+      ref: 'refs/heads/picked',
+    })
+    await fs.write(`${gitdirsmfullpath}/CHERRY_PICK_HEAD`, `${picked}\n`)
+    await fs.write(
+      `${gitdirsmfullpath}/MERGE_MSG`,
+      `${message}\n# Conflicts:\n#\ta.txt\n`
+    )
+    await fs.write(`${dir}/a.txt`, 'resolved')
+    await add({ fs, dir, gitdir, filepath: 'a.txt' })
+
+    // Like `git commit`: the picked author and message, the current committer.
+    const oid = await commit({ fs, dir, gitdir })
+    const { commit: made } = await readCommit({ fs, gitdir, oid })
+    expect(made.message).toBe(message)
+    expect(made.author).toEqual(original)
+    expect(made.committer.name).toBe('Committer')
+    expect(made.committer.email).toBe('committer@example.com')
+    expect(made.committer.timestamp).not.toBe(original.timestamp)
+    expect(await fs.exists(`${gitdirsmfullpath}/CHERRY_PICK_HEAD`)).toBe(false)
+    expect(await fs.exists(`${gitdirsmfullpath}/MERGE_MSG`)).toBe(false)
   })
 })
