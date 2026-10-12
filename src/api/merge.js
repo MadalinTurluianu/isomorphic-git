@@ -36,9 +36,10 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  * By default, if isomorphic-git encounters a merge conflict it cannot resolve using the builtin diff3 algorithm or provided merge driver, it will abort and throw a `MergeNotSupportedError`.
  * This leaves the index and working tree untouched.
  *
- * When `abortOnConflict` is set to `false`, and a merge conflict cannot be automatically resolved, a `MergeConflictError` is thrown and the results of the incomplete merge will be written to the working directory.
- * This includes conflict markers in files with unresolved merge conflicts.
+ * When `abortOnConflict` is set to `false`, and a merge conflict cannot be automatically resolved, a `MergeConflictError` is thrown and the results of the incomplete merge will be written to the working directory and the index, the way `git merge` leaves them:
+ * files the merge changed are updated and staged, files with unresolved conflicts contain conflict markers and are recorded in the index with their base, ours and theirs versions, and files the merge does not touch are left alone.
  * Binary files are never merged: ours is kept in the working directory and the conflict is recorded in the index.
+ * Writing conflicts to the working tree assumes that `ours` is the checked-out branch, as it always is in git: only what differs between `ours` and the merge result is written.
  *
  * To complete the merge, edit the conflicting files as you see fit, and then add and commit the resolved merge.
  *

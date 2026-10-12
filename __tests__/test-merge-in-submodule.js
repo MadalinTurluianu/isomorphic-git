@@ -9,12 +9,16 @@ import {
   checkout,
   init,
   readBlob,
+  readTree,
+  remove,
   resolveRef,
   log,
   status,
   statusMatrix,
   commit as gitCommit,
   annotatedTag,
+  writeBlob,
+  writeTree,
 } from 'isomorphic-git'
 import { GitIndexManager } from 'isomorphic-git/internal-apis'
 
@@ -1643,6 +1647,293 @@ describe('merge', () => {
 
     // The text conflict still materialises in the working directory.
     expect(await fs.read(`${dir}/doc.txt`, 'utf8')).toContain('<<<<<<<')
+  })
+
+  describe('conflicts written to the working tree', () => {
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: -0,
+    }
+
+    // base:    conflict.txt, theirs.txt, ours.txt, both.txt, gone.txt,
+    //          same.txt, run.sh (executable), sub/nested.txt
+    // feature: edits conflict.txt, theirs.txt, both.txt (end), run.sh and
+    //          sub/nested.txt, deletes gone.txt, adds added.txt
+    // master:  edits conflict.txt, ours.txt and both.txt (start)
+    async function setup(name) {
+      const { fs, dir, gitdir, gitdirsmfullpath } =
+        await makeFixtureAsSubmodule(name)
+      await init({ fs, dir, gitdir })
+      await fs.write(`${dir}/conflict.txt`, 'one\ntwo\nthree\n')
+      await fs.write(`${dir}/theirs.txt`, 'base\n')
+      await fs.write(`${dir}/ours.txt`, 'base\n')
+      await fs.write(`${dir}/both.txt`, 'start\nmiddle\nend\n')
+      await fs.write(`${dir}/gone.txt`, 'gone\n')
+      await fs.write(`${dir}/same.txt`, 'same\n')
+      await fs.write(`${dir}/run.sh`, '#!/bin/sh\n', { mode: 0o777 })
+      await fs.write(`${dir}/sub/nested.txt`, 'base\n')
+      await add({ fs, dir, gitdir, filepath: '.' })
+      const baseOid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'base',
+        author,
+      })
+
+      await branch({ fs, dir, gitdir, ref: 'feature', checkout: true })
+      await fs.write(`${dir}/conflict.txt`, 'one\nfeature\nthree\n')
+      await fs.write(`${dir}/theirs.txt`, 'feature\n')
+      await fs.write(`${dir}/both.txt`, 'start\nmiddle\nfeature end\n')
+      await fs.write(`${dir}/run.sh`, '#!/bin/sh\necho feature\n')
+      await fs.write(`${dir}/sub/nested.txt`, 'feature\n')
+      await fs.write(`${dir}/added.txt`, 'added\n')
+      await fs.rm(`${dir}/gone.txt`)
+      await add({ fs, dir, gitdir, filepath: '.' })
+      await remove({ fs, dir, gitdir, filepath: 'gone.txt' })
+      const featureOid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'feature',
+        author,
+      })
+
+      await checkout({ fs, dir, gitdir, ref: 'master' })
+      await fs.write(`${dir}/conflict.txt`, 'one\nmaster\nthree\n')
+      await fs.write(`${dir}/ours.txt`, 'master\n')
+      await fs.write(`${dir}/both.txt`, 'master start\nmiddle\nend\n')
+      await add({ fs, dir, gitdir, filepath: '.' })
+      const masterOid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'master',
+        author,
+      })
+      return {
+        fs,
+        dir,
+        gitdir,
+        gitdirsmfullpath,
+        baseOid,
+        featureOid,
+        masterOid,
+      }
+    }
+
+    async function mergeFeature(repo, options = {}) {
+      const { fs, dir, gitdir } = repo
+      let error = null
+      try {
+        await merge({
+          fs,
+          dir,
+          gitdir,
+          ours: 'master',
+          theirs: 'feature',
+          abortOnConflict: false,
+          author,
+          ...options,
+        })
+      } catch (e) {
+        error = e
+      }
+      expect(error).not.toBeNull()
+      return error
+    }
+
+    async function readIndex(repo) {
+      const { fs, gitdirsmfullpath } = repo
+      return GitIndexManager.acquire(
+        { fs, gitdir: gitdirsmfullpath, cache: {} },
+        async index => ({
+          unmergedPaths: index.unmergedPaths,
+          entries: new Map(
+            index.entriesFlat.map(e => [`${e.path}:${e.flags.stage}`, e])
+          ),
+        })
+      )
+    }
+
+    it('leaves the working tree and index the way git does', async () => {
+      const repo = await setup('tmp-merge-conflict-state')
+      const { fs, dir, gitdir, baseOid, featureOid, masterOid } = repo
+
+      const error = await mergeFeature(repo)
+      expect(error.code).toBe(Errors.MergeConflictError.code)
+      expect(error.data.filepaths).toEqual(['conflict.txt'])
+
+      // Only the conflicted file is unmerged, with all three versions.
+      const index = await readIndex(repo)
+      expect(index.unmergedPaths).toEqual(['conflict.txt'])
+      expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toBe(
+        'one\n<<<<<<< HEAD\nmaster\n=======\nfeature\n>>>>>>> feature\nthree\n'
+      )
+      const stageOids = [1, 2, 3].map(
+        stage => index.entries.get(`conflict.txt:${stage}`).oid
+      )
+      const blob = async (oid, filepath) =>
+        (await readBlob({ fs, gitdir, oid, filepath })).oid
+      expect(stageOids).toEqual([
+        await blob(baseOid, 'conflict.txt'),
+        await blob(masterOid, 'conflict.txt'),
+        await blob(featureOid, 'conflict.txt'),
+      ])
+
+      // Everything else the merge changed is written and staged.
+      expect(await fs.read(`${dir}/theirs.txt`, 'utf8')).toBe('feature\n')
+      expect(await status({ fs, dir, gitdir, filepath: 'theirs.txt' })).toBe(
+        'modified'
+      )
+      expect(await fs.read(`${dir}/both.txt`, 'utf8')).toBe(
+        'master start\nmiddle\nfeature end\n'
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'both.txt' })).toBe(
+        'modified'
+      )
+      expect(
+        await status({ fs, dir, gitdir, filepath: 'sub/nested.txt' })
+      ).toBe('modified')
+      expect(await fs.read(`${dir}/added.txt`, 'utf8')).toBe('added\n')
+      expect(await status({ fs, dir, gitdir, filepath: 'added.txt' })).toBe(
+        'added'
+      )
+      expect(await fs.exists(`${dir}/gone.txt`)).toBe(false)
+      expect(await status({ fs, dir, gitdir, filepath: 'gone.txt' })).toBe(
+        'deleted'
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'ours.txt' })).toBe(
+        'unmodified'
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'same.txt' })).toBe(
+        'unmodified'
+      )
+      // The mode recorded for a rewritten file is the one from the tree.
+      const { tree } = await readTree({ fs, gitdir, oid: featureOid })
+      const treeModes = tree.map(entry => [entry.path, entry.mode])
+      expect(treeModes).toContainEqual([
+        'run.sh',
+        index.entries.get('run.sh:0').mode.toString(8),
+      ])
+
+      // Resolving, adding and committing finishes the merge with their
+      // changes included, exactly like `git commit` would.
+      await fs.write(`${dir}/conflict.txt`, 'one\nresolved\nthree\n')
+      await add({ fs, dir, gitdir, filepath: 'conflict.txt' })
+      const mergeOid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'merge',
+        author,
+        parent: [masterOid, featureOid],
+      })
+      const read = async filepath =>
+        Buffer.from(
+          (await readBlob({ fs, gitdir, oid: mergeOid, filepath })).blob
+        ).toString('utf8')
+      expect(await read('conflict.txt')).toBe('one\nresolved\nthree\n')
+      expect(await read('theirs.txt')).toBe('feature\n')
+      expect(await read('both.txt')).toBe('master start\nmiddle\nfeature end\n')
+      expect(await read('added.txt')).toBe('added\n')
+      expect(await read('ours.txt')).toBe('master\n')
+      await expect(read('gone.txt')).rejects.toMatchObject({
+        code: Errors.NotFoundError.code,
+      })
+      const matrix = await statusMatrix({ fs, dir, gitdir })
+      expect(matrix.every(row => row.slice(1).join() === '1,1,1')).toBe(true)
+    })
+
+    it('keeps local changes in files the merge does not touch', async () => {
+      const repo = await setup('tmp-merge-conflict-untouched')
+      const { fs, dir, gitdir } = repo
+      await fs.write(`${dir}/same.txt`, 'local\n')
+      await fs.write(`${dir}/untracked.txt`, 'untracked\n')
+
+      const error = await mergeFeature(repo)
+      expect(error.code).toBe(Errors.MergeConflictError.code)
+
+      expect(await fs.read(`${dir}/same.txt`, 'utf8')).toBe('local\n')
+      expect(await status({ fs, dir, gitdir, filepath: 'same.txt' })).toBe(
+        '*modified'
+      )
+      expect(await fs.read(`${dir}/untracked.txt`, 'utf8')).toBe('untracked\n')
+      expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toContain('<<<<<<<')
+    })
+
+    it('writes nothing with dryRun', async () => {
+      const repo = await setup('tmp-merge-dry-run')
+      const { fs, dir, gitdir } = repo
+      await fs.write(`${dir}/theirs.txt`, 'local\n')
+
+      const error = await mergeFeature(repo, { dryRun: true })
+      expect(error.code).toBe(Errors.MergeConflictError.code)
+      expect(await fs.read(`${dir}/theirs.txt`, 'utf8')).toBe('local\n')
+      expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toBe(
+        'one\nmaster\nthree\n'
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'conflict.txt' })).toBe(
+        'unmodified'
+      )
+    })
+
+    it('replaces a directory with a file the way git does', async () => {
+      const { fs, dir, gitdir } = await makeFixtureAsSubmodule(
+        'tmp-merge-dir-to-file'
+      )
+      await init({ fs, dir, gitdir })
+      await fs.write(`${dir}/conflict.txt`, 'one\ntwo\nthree\n')
+      await fs.write(`${dir}/sub/nested.txt`, 'base\n')
+      await add({ fs, dir, gitdir, filepath: '.' })
+      const baseOid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'base',
+        author,
+      })
+      // feature turns the directory into a file. Built from objects, since
+      // checkout does not make that change.
+      const blob = async content => ({
+        mode: '100644',
+        type: 'blob',
+        oid: await writeBlob({ fs, gitdir, blob: Buffer.from(content) }),
+      })
+      await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        ref: 'refs/heads/feature',
+        parent: [baseOid],
+        tree: await writeTree({
+          fs,
+          gitdir,
+          tree: [
+            { path: 'conflict.txt', ...(await blob('one\nfeature\nthree\n')) },
+            { path: 'sub', ...(await blob('now a file\n')) },
+          ],
+        }),
+        message: 'feature',
+        author,
+      })
+      await fs.write(`${dir}/conflict.txt`, 'one\nmaster\nthree\n')
+      await add({ fs, dir, gitdir, filepath: 'conflict.txt' })
+      await gitCommit({ fs, dir, gitdir, message: 'master', author })
+      const repo = { fs, dir, gitdir }
+
+      const error = await mergeFeature(repo)
+      expect(error.code).toBe(Errors.MergeConflictError.code)
+      expect(error.data.filepaths).toEqual(['conflict.txt'])
+      expect(await fs.read(`${dir}/sub`, 'utf8')).toBe('now a file\n')
+      expect(await statusMatrix({ fs, dir, gitdir })).toEqual([
+        ['conflict.txt', 1, 2, 3],
+        ['sub', 0, 2, 2],
+        ['sub/nested.txt', 1, 0, 0],
+      ])
+    })
   })
 
   describe('binary files and other bytes', () => {
