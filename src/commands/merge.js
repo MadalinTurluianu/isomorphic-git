@@ -6,10 +6,12 @@ import { _currentBranch } from '../commands/currentBranch.js'
 import { _findMergeBase } from '../commands/findMergeBase.js'
 import { FastForwardError } from '../errors/FastForwardError.js'
 import { MergeConflictError } from '../errors/MergeConflictError.js'
+import { MergeLocalChangesError } from '../errors/MergeLocalChangesError.js'
 import { MergeNotSupportedError } from '../errors/MergeNotSupportedError.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { abbreviateRef } from '../utils/abbreviateRef.js'
+import { findLocalChanges } from '../utils/findLocalChanges.js'
 import { mergeTree } from '../utils/mergeTree.js'
 import { resolveCommit } from '../utils/resolveCommit.js'
 
@@ -136,6 +138,20 @@ export async function _merge({
     // not a simple fast-forward
     if (fastForwardOnly) {
       throw new FastForwardError()
+    }
+    // Conflicts are written to the working tree and the index. Like git,
+    // refuse to start if that would overwrite local changes.
+    if (dir && !abortOnConflict && !dryRun) {
+      const filepaths = await findLocalChanges({
+        fs,
+        cache,
+        dir,
+        gitdir,
+        headTree: ourOid,
+        baseTree: baseOid,
+        theirTree: theirOid,
+      })
+      if (filepaths.length > 0) throw new MergeLocalChangesError(filepaths)
     }
     // try a fancier merge
     const tree = await GitIndexManager.acquire(

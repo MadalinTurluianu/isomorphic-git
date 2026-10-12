@@ -222,6 +222,77 @@ describe('cherryPick in submodule', () => {
     expect(entries.get('mod.txt').size).toBe('much longer content\n'.length)
   })
 
+  it('overwrites an untracked file that .gitignore ignores, like git', async () => {
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: -0,
+    }
+    for (const conflict of [false, true]) {
+      const { fs, dir, gitdir } = await makeFixtureAsSubmodule(
+        `tmp-cherry-ignored-${conflict}`
+      )
+      await init({ fs, dir, gitdir })
+      await fs.write(join(dir, '.gitignore'), '.local\n')
+      await fs.write(join(dir, 'f.txt'), 'one\ntwo\nthree\n')
+      await add({ fs, dir, gitdir, filepath: '.' })
+      await gitCommit({ fs, dir, gitdir, message: 'base', author })
+      await branch({ fs, dir, gitdir, ref: 'other', checkout: true })
+      await fs.write(join(dir, '.local/folder.lock'), 'theirs\n')
+      await add({
+        fs,
+        dir,
+        gitdir,
+        filepath: '.local/folder.lock',
+        force: true,
+      })
+      if (conflict) {
+        await fs.write(join(dir, 'f.txt'), 'one\nother\nthree\n')
+        await add({ fs, dir, gitdir, filepath: 'f.txt' })
+      }
+      const oid = await gitCommit({
+        fs,
+        dir,
+        gitdir,
+        message: 'other',
+        author,
+      })
+      await checkout({ fs, dir, gitdir, ref: 'master' })
+      if (conflict) {
+        await fs.write(join(dir, 'f.txt'), 'one\nmaster\nthree\n')
+        await add({ fs, dir, gitdir, filepath: 'f.txt' })
+        await gitCommit({ fs, dir, gitdir, message: 'master', author })
+      }
+      await fs.write(join(dir, '.local/folder.lock'), 'mine\n')
+
+      let error = null
+      try {
+        await cherryPick({
+          fs,
+          dir,
+          gitdir,
+          oid,
+          committer: author,
+          abortOnConflict: false,
+        })
+      } catch (e) {
+        error = e
+      }
+      if (conflict) {
+        expect(error && error.code).toBe(Errors.MergeConflictError.code)
+      } else {
+        expect(error).toBeNull()
+      }
+      expect(await fs.read(join(dir, '.local/folder.lock'), 'utf8')).toBe(
+        'theirs\n'
+      )
+      expect(
+        await status({ fs, dir, gitdir, filepath: '.local/folder.lock' })
+      ).toBe(conflict ? 'added' : 'unmodified')
+    }
+  })
+
   it('cherry-pick with dryRun', async () => {
     // Setup - programmatic submodule repo
     const { fs: fssp, dir: dirsp } = await makeFixture('superproject-test')

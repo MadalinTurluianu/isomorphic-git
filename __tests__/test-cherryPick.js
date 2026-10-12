@@ -770,23 +770,96 @@ describe('cherryPick', () => {
       // The recorded size is the new file's, so git does not see it as changed.
       expect(entries.get('mod.txt').size).toBe('much longer content\n'.length)
     })
-    it('rejects any tracked local edit when conflicts would be written out', async () => {
+    it('overwrites an untracked file that .gitignore ignores, like git', async () => {
+      for (const conflict of [false, true]) {
+        const { fs, dir, gitdir } = await makeFixture(
+          `tmp-cherry-ignored-${conflict}`
+        )
+        await init({ fs, dir, gitdir })
+        await fs.write(join(dir, '.gitignore'), '.local\n')
+        await fs.write(join(dir, 'f.txt'), 'one\ntwo\nthree\n')
+        await add({ fs, dir, gitdir, filepath: '.' })
+        await gitCommit({ fs, dir, gitdir, message: 'base', author })
+        await branch({ fs, dir, gitdir, ref: 'other', checkout: true })
+        await fs.write(join(dir, '.local/folder.lock'), 'theirs\n')
+        await add({
+          fs,
+          dir,
+          gitdir,
+          filepath: '.local/folder.lock',
+          force: true,
+        })
+        if (conflict) {
+          await fs.write(join(dir, 'f.txt'), 'one\nother\nthree\n')
+          await add({ fs, dir, gitdir, filepath: 'f.txt' })
+        }
+        const oid = await gitCommit({
+          fs,
+          dir,
+          gitdir,
+          message: 'other',
+          author,
+        })
+        await checkout({ fs, dir, gitdir, ref: 'master' })
+        if (conflict) {
+          await fs.write(join(dir, 'f.txt'), 'one\nmaster\nthree\n')
+          await add({ fs, dir, gitdir, filepath: 'f.txt' })
+          await gitCommit({
+            fs,
+            dir,
+            gitdir,
+            message: 'master',
+            author,
+          })
+        }
+        await fs.write(join(dir, '.local/folder.lock'), 'mine\n')
+
+        let error = null
+        try {
+          await cherryPick({
+            fs,
+            dir,
+            gitdir,
+            oid,
+            committer: author,
+            abortOnConflict: false,
+          })
+        } catch (e) {
+          error = e
+        }
+        if (conflict) {
+          expect(error && error.code).toBe(Errors.MergeConflictError.code)
+        } else {
+          expect(error).toBeNull()
+        }
+        expect(await fs.read(join(dir, '.local/folder.lock'), 'utf8')).toBe(
+          'theirs\n'
+        )
+        expect(
+          await status({ fs, dir, gitdir, filepath: '.local/folder.lock' })
+        ).toBe(conflict ? 'added' : 'unmodified')
+      }
+    })
+    it('rejects a staged change to a file the commit does not touch', async () => {
+      const repo = await setup('tmp-cherry-dirty-staged-other')
+      const { fs, dir, gitdir } = repo
+      await fs._writeFile(join(dir, 'other.txt'), 'local-staged\n')
+      await add({ fs, dir, gitdir, filepath: 'other.txt' })
+
+      await expectRejected(repo, ['other.txt'])
+      expect(await status({ fs, dir, gitdir, filepath: 'other.txt' })).toBe(
+        'modified'
+      )
+    })
+    it('writes conflicts without touching other local changes', async () => {
       const repo = await setup('tmp-cherry-dirty-conflict-write')
       const { fs, dir, gitdir, featureOid } = repo
       await fs._writeFile(join(dir, 'file.txt'), 'master-change\n')
       await add({ fs, dir, gitdir, filepath: 'file.txt' })
       await gitCommit({ fs, dir, gitdir, message: 'master change', author })
-      repo.headOid = await resolveRef({ fs, gitdir, ref: 'HEAD' })
       await fs._writeFile(join(dir, 'other.txt'), 'local-dirty\n')
       await fs._writeFile(join(dir, 'untracked.txt'), 'untracked\n')
 
-      await expectRejected(repo, ['other.txt'], { abortOnConflict: false })
-      expect(await fs.read(join(dir, 'other.txt'), 'utf8')).toBe(
-        'local-dirty\n'
-      )
-
-      // Without local changes the conflict is written out as before.
-      await fs._writeFile(join(dir, 'other.txt'), 'other\n')
       let error = null
       try {
         await cherryPick({
@@ -802,8 +875,18 @@ describe('cherryPick', () => {
       }
       expect(error.code).toBe(Errors.MergeConflictError.code)
       expect(await fs.read(join(dir, 'file.txt'), 'utf8')).toContain('<<<<<<<')
+      expect(await fs.read(join(dir, 'other.txt'), 'utf8')).toBe(
+        'local-dirty\n'
+      )
       expect(await fs.read(join(dir, 'untracked.txt'), 'utf8')).toBe(
         'untracked\n'
+      )
+      // The rest of the pick is staged, like git does.
+      expect(await status({ fs, dir, gitdir, filepath: 'added.txt' })).toBe(
+        'added'
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'gone.txt' })).toBe(
+        'deleted'
       )
     })
   })

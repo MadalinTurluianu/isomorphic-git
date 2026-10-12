@@ -39,7 +39,11 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  * When `abortOnConflict` is set to `false`, and a merge conflict cannot be automatically resolved, a `MergeConflictError` is thrown and the results of the incomplete merge will be written to the working directory and the index, the way `git merge` leaves them:
  * files the merge changed are updated and staged, files with unresolved conflicts contain conflict markers and are recorded in the index with their base, ours and theirs versions, and files the merge does not touch are left alone.
  * Binary files are never merged: ours is kept in the working directory and the conflict is recorded in the index.
- * Writing conflicts to the working tree assumes that `ours` is the checked-out branch, as it always is in git: only what differs between `ours` and the merge result is written.
+ *
+ * Like `git merge`, this refuses to start when writing the result would overwrite local changes: any staged change, an unstaged edit to a file the merge changes, or an untracked file in its way.
+ * Untracked files that `.gitignore` ignores are not in the way: like git, the merge overwrites them.
+ * A `MergeLocalChangesError` listing those files is thrown before anything is written.
+ * Writing conflicts to the working tree assumes that `ours` is the checked-out branch, as it always is in git: only what differs between `ours` and the merge result is written, and the staged changes are found by comparing the index with `ours`.
  *
  * To complete the merge, edit the conflicting files as you see fit, and then add and commit the resolved merge.
  *

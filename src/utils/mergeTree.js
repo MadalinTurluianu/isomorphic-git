@@ -485,6 +485,12 @@ export async function applyMergedTree({
           index.delete({ filepath })
           removed.push(filepath)
         }
+      } else {
+        // Nothing of ours is here, but an untracked file that .gitignore
+        // ignores may be, since findLocalChanges lets those through. Like
+        // git, replace it, or remove it to make room for a directory.
+        const stats = await fs.lstat(fullpath)
+        if (stats && !stats.isDirectory()) await fs.rm(fullpath)
       }
       if (mergedType !== 'blob') return
       await assertNoSymlinkInLeadingPath(fs, dir, filepath)

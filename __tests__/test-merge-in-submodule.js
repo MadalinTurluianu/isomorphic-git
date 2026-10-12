@@ -1388,6 +1388,9 @@ describe('merge', () => {
       author,
     })
 
+    // Back on master's version before merging, as a user would be.
+    await checkout({ fs, dir, gitdir, ref: 'master', force: true })
+
     let error = null
     try {
       await merge({
@@ -1530,6 +1533,9 @@ describe('merge', () => {
       author,
     })
 
+    // Back on master's version before merging, as a user would be.
+    await checkout({ fs, dir, gitdir, ref: 'master', force: true })
+
     let error = null
     try {
       await merge({
@@ -1618,6 +1624,9 @@ describe('merge', () => {
       message: 'Edit the text file on other',
       author,
     })
+
+    // Back on master's version before merging, as a user would be.
+    await checkout({ fs, dir, gitdir, ref: 'master', force: true })
 
     let error = null
     try {
@@ -1864,20 +1873,213 @@ describe('merge', () => {
       expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toContain('<<<<<<<')
     })
 
-    it('writes nothing with dryRun', async () => {
-      const repo = await setup('tmp-merge-dry-run')
-      const { fs, dir, gitdir } = repo
-      await fs.write(`${dir}/theirs.txt`, 'local\n')
+    describe('local changes', () => {
+      async function expectRejected(repo, filepaths) {
+        const { fs, dir, gitdir, masterOid } = repo
+        const error = await mergeFeature(repo)
+        expect(error.code).toBe(Errors.MergeLocalChangesError.code)
+        expect(error.data.filepaths).toEqual(filepaths)
+        // Nothing was written.
+        expect(await resolveRef({ fs, gitdir, ref: 'master' })).toBe(masterOid)
+        expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toBe(
+          'one\nmaster\nthree\n'
+        )
+        expect(await fs.exists(`${dir}/added.txt`)).toBe(
+          filepaths.includes('added.txt')
+        )
+      }
 
-      const error = await mergeFeature(repo, { dryRun: true })
-      expect(error.code).toBe(Errors.MergeConflictError.code)
-      expect(await fs.read(`${dir}/theirs.txt`, 'utf8')).toBe('local\n')
-      expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toBe(
-        'one\nmaster\nthree\n'
-      )
-      expect(await status({ fs, dir, gitdir, filepath: 'conflict.txt' })).toBe(
-        'unmodified'
-      )
+      it('rejects a staged change, even in a file the merge does not touch', async () => {
+        const repo = await setup('tmp-merge-dirty-staged')
+        const { fs, dir, gitdir } = repo
+        await fs.write(`${dir}/same.txt`, 'staged\n')
+        await add({ fs, dir, gitdir, filepath: 'same.txt' })
+
+        await expectRejected(repo, ['same.txt'])
+        expect(await status({ fs, dir, gitdir, filepath: 'same.txt' })).toBe(
+          'modified'
+        )
+      })
+
+      it('rejects an unstaged edit to a file the merge changes', async () => {
+        const repo = await setup('tmp-merge-dirty-unstaged')
+        const { fs, dir } = repo
+        await fs.write(`${dir}/theirs.txt`, 'local\n')
+
+        await expectRejected(repo, ['theirs.txt'])
+        expect(await fs.read(`${dir}/theirs.txt`, 'utf8')).toBe('local\n')
+      })
+
+      it('rejects an untracked file where the merge adds one', async () => {
+        const repo = await setup('tmp-merge-dirty-untracked')
+        const { fs, dir } = repo
+        await fs.write(`${dir}/added.txt`, 'untracked\n')
+
+        await expectRejected(repo, ['added.txt'])
+        expect(await fs.read(`${dir}/added.txt`, 'utf8')).toBe('untracked\n')
+      })
+
+      it('keeps an unstaged edit in a file both sides changed the same way', async () => {
+        const repo = await setup('tmp-merge-dirty-same-change')
+        const { fs, dir, gitdir } = repo
+        for (const ref of ['feature', 'master']) {
+          await checkout({ fs, dir, gitdir, ref })
+          await fs.write(`${dir}/twin.txt`, 'both\n')
+          await add({ fs, dir, gitdir, filepath: 'twin.txt' })
+          await gitCommit({
+            fs,
+            dir,
+            gitdir,
+            message: `twin on ${ref}`,
+            author,
+          })
+        }
+        await fs.write(`${dir}/twin.txt`, 'local edit\n')
+
+        // The merge does not write twin.txt, so git lets it through.
+        const error = await mergeFeature(repo)
+        expect(error.code).toBe(Errors.MergeConflictError.code)
+        expect(await fs.read(`${dir}/twin.txt`, 'utf8')).toBe('local edit\n')
+      })
+
+      it('does not look for local changes when nothing is written', async () => {
+        const repo = await setup('tmp-merge-dirty-abort')
+        const { fs, dir, gitdir } = repo
+        await fs.write(`${dir}/theirs.txt`, 'local\n')
+
+        for (const options of [{ abortOnConflict: true }, { dryRun: true }]) {
+          const error = await mergeFeature(repo, options)
+          expect(error.code).toBe(Errors.MergeConflictError.code)
+          expect(await fs.read(`${dir}/theirs.txt`, 'utf8')).toBe('local\n')
+          expect(await fs.read(`${dir}/conflict.txt`, 'utf8')).toBe(
+            'one\nmaster\nthree\n'
+          )
+          expect(
+            await status({ fs, dir, gitdir, filepath: 'conflict.txt' })
+          ).toBe('unmodified')
+        }
+      })
+    })
+
+    describe('files that .gitignore ignores', () => {
+      // master ignores .local and has an untracked .local/folder.lock; other
+      // tracks that file. Both change f.txt, so the merge stops on a conflict.
+      async function ignoredRepo(
+        name,
+        { ignore = '.local\n', tracked = '' } = {}
+      ) {
+        const { fs, dir, gitdir } = await makeFixtureAsSubmodule(name)
+        await init({ fs, dir, gitdir })
+        await fs.write(`${dir}/.gitignore`, ignore)
+        await fs.write(`${dir}/f.txt`, 'one\ntwo\nthree\n')
+        await add({ fs, dir, gitdir, filepath: '.' })
+        if (tracked) {
+          await fs.write(`${dir}/${tracked}`, 'base\n')
+          await add({ fs, dir, gitdir, filepath: tracked, force: true })
+        }
+        await gitCommit({ fs, dir, gitdir, message: 'base', author })
+        await branch({ fs, dir, gitdir, ref: 'other', checkout: true })
+        await fs.write(`${dir}/.local/folder.lock`, 'theirs\n')
+        await add({
+          fs,
+          dir,
+          gitdir,
+          filepath: '.local/folder.lock',
+          force: true,
+        })
+        await fs.write(`${dir}/f.txt`, 'one\nother\nthree\n')
+        await add({ fs, dir, gitdir, filepath: 'f.txt' })
+        if (tracked) {
+          await fs.write(`${dir}/${tracked}`, 'theirs\n')
+          await add({ fs, dir, gitdir, filepath: tracked, force: true })
+        }
+        await gitCommit({ fs, dir, gitdir, message: 'other', author })
+        await checkout({ fs, dir, gitdir, ref: 'master' })
+        await fs.write(`${dir}/f.txt`, 'one\nmaster\nthree\n')
+        await add({ fs, dir, gitdir, filepath: 'f.txt' })
+        await gitCommit({ fs, dir, gitdir, message: 'master', author })
+        await fs.write(`${dir}/.local/folder.lock`, 'mine\n')
+        return { fs, dir, gitdir }
+      }
+
+      async function mergeOther({ fs, dir, gitdir }) {
+        let error = null
+        try {
+          await merge({
+            fs,
+            dir,
+            gitdir,
+            ours: 'master',
+            theirs: 'other',
+            abortOnConflict: false,
+            author,
+          })
+        } catch (e) {
+          error = e
+        }
+        expect(error).not.toBeNull()
+        return error
+      }
+
+      it('overwrites an untracked file that .gitignore ignores, like git', async () => {
+        const repo = await ignoredRepo('tmp-merge-ignored')
+        const { fs, dir, gitdir } = repo
+
+        const error = await mergeOther(repo)
+        expect(error.code).toBe(Errors.MergeConflictError.code)
+        expect(error.data.filepaths).toEqual(['f.txt'])
+        expect(await fs.read(`${dir}/.local/folder.lock`, 'utf8')).toBe(
+          'theirs\n'
+        )
+        expect(
+          await status({ fs, dir, gitdir, filepath: '.local/folder.lock' })
+        ).toBe('added')
+      })
+
+      it('still refuses to overwrite an untracked file that is not ignored', async () => {
+        const repo = await ignoredRepo('tmp-merge-ignored-not', { ignore: '' })
+        const { fs, dir } = repo
+
+        const error = await mergeOther(repo)
+        expect(error.code).toBe(Errors.MergeLocalChangesError.code)
+        expect(error.data.filepaths).toEqual(['.local/folder.lock'])
+        expect(await fs.read(`${dir}/.local/folder.lock`, 'utf8')).toBe(
+          'mine\n'
+        )
+      })
+
+      it('still refuses to overwrite an edit to a tracked file that .gitignore ignores', async () => {
+        const repo = await ignoredRepo('tmp-merge-ignored-tracked', {
+          tracked: '.local/tracked.txt',
+        })
+        const { fs, dir } = repo
+        await fs.rm(`${dir}/.local/folder.lock`)
+        await fs.write(`${dir}/.local/tracked.txt`, 'local edit\n')
+
+        const error = await mergeOther(repo)
+        expect(error.code).toBe(Errors.MergeLocalChangesError.code)
+        expect(error.data.filepaths).toEqual(['.local/tracked.txt'])
+        expect(await fs.read(`${dir}/.local/tracked.txt`, 'utf8')).toBe(
+          'local edit\n'
+        )
+      })
+
+      it('removes an ignored file where the merge needs a directory', async () => {
+        const repo = await ignoredRepo('tmp-merge-ignored-dir', {
+          ignore: '.local\n',
+        })
+        const { fs, dir } = repo
+        // .local itself is an ignored file now, where other has a directory.
+        await fs.rm(`${dir}/.local/folder.lock`)
+        await fs.rmdir(`${dir}/.local`)
+        await fs.write(`${dir}/.local`, 'an ignored file\n')
+
+        const error = await mergeOther(repo)
+        expect(error.code).toBe(Errors.MergeConflictError.code)
+        expect(await fs.read(`${dir}/.local/folder.lock`, 'utf8')).toBe(
+          'theirs\n'
+        )
+      })
     })
 
     it('replaces a directory with a file the way git does', async () => {
@@ -1924,7 +2126,15 @@ describe('merge', () => {
       await gitCommit({ fs, dir, gitdir, message: 'master', author })
       const repo = { fs, dir, gitdir }
 
-      const error = await mergeFeature(repo)
+      // An untracked file inside the directory would be lost: refused.
+      await fs.write(`${dir}/sub/untracked.txt`, 'untracked\n')
+      let error = await mergeFeature(repo)
+      expect(error.code).toBe(Errors.MergeLocalChangesError.code)
+      expect(error.data.filepaths).toEqual(['sub/untracked.txt'])
+      expect(await fs.read(`${dir}/sub/nested.txt`, 'utf8')).toBe('base\n')
+      await fs.rm(`${dir}/sub/untracked.txt`)
+
+      error = await mergeFeature(repo)
       expect(error.code).toBe(Errors.MergeConflictError.code)
       expect(error.data.filepaths).toEqual(['conflict.txt'])
       expect(await fs.read(`${dir}/sub`, 'utf8')).toBe('now a file\n')
