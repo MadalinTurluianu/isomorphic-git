@@ -5,12 +5,18 @@ import {
   Errors,
   merge,
   add,
+  branch,
+  checkout,
+  init,
+  readBlob,
   resolveRef,
   log,
+  status,
   statusMatrix,
   commit as gitCommit,
   annotatedTag,
 } from 'isomorphic-git'
+import { GitIndexManager } from 'isomorphic-git/internal-apis'
 
 import { makeFixtureAsSubmodule } from './__helpers__/FixtureFSSubmodule.js'
 
@@ -1637,5 +1643,87 @@ describe('merge', () => {
 
     // The text conflict still materialises in the working directory.
     expect(await fs.read(`${dir}/doc.txt`, 'utf8')).toContain('<<<<<<<')
+  })
+
+  describe('binary files and other bytes', () => {
+    const author = {
+      name: 'Mr. Test',
+      email: 'mrtest@example.com',
+      timestamp: 1262356920,
+      timezoneOffset: -0,
+    }
+
+    it('does not merge binary files and keeps other bytes intact', async () => {
+      const { fs, dir, gitdir, gitdirsmfullpath } =
+        await makeFixtureAsSubmodule('tmp-merge-binary')
+      await init({ fs, dir, gitdir })
+      // A NUL byte in the first 8000 bytes makes a file binary, like in git.
+      const binary = {
+        base: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 1, 2, 3]),
+        feature: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 1, 2, 4]),
+        master: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 1, 2, 5]),
+      }
+      // Latin-1 text with a lone CR inside a line: not valid UTF-8 and not a
+      // line ending git knows, but still text.
+      const latin1 = {
+        base: Buffer.from('caf\xe9\rcr\nmiddle\nend\n', 'latin1'),
+        feature: Buffer.from('caf\xe9\rcr\nmiddle\nfeature\n', 'latin1'),
+        master: Buffer.from('master caf\xe9\rcr\nmiddle\nend\n', 'latin1'),
+        merged: Buffer.from('master caf\xe9\rcr\nmiddle\nfeature\n', 'latin1'),
+      }
+      const commitBoth = async (version, message) => {
+        await fs.write(`${dir}/image.bin`, binary[version])
+        await fs.write(`${dir}/latin1.txt`, latin1[version])
+        await add({ fs, dir, gitdir, filepath: '.' })
+        return gitCommit({ fs, dir, gitdir, message, author })
+      }
+      const baseOid = await commitBoth('base', 'base')
+      await branch({ fs, dir, gitdir, ref: 'feature', checkout: true })
+      const featureOid = await commitBoth('feature', 'feature')
+      await checkout({ fs, dir, gitdir, ref: 'master' })
+      const masterOid = await commitBoth('master', 'master')
+
+      let error = null
+      try {
+        await merge({
+          fs,
+          dir,
+          gitdir,
+          ours: 'master',
+          theirs: 'feature',
+          abortOnConflict: false,
+          author,
+        })
+      } catch (e) {
+        error = e
+      }
+      expect(error).not.toBeNull()
+      expect(error.code).toBe(Errors.MergeConflictError.code)
+      expect(error.data.filepaths).toEqual(['image.bin'])
+
+      // Ours stays in the working tree, all three versions are in the index.
+      expect(Array.from(await fs.read(`${dir}/image.bin`))).toEqual(
+        Array.from(binary.master)
+      )
+      const index = await GitIndexManager.acquire(
+        { fs, gitdir: gitdirsmfullpath, cache: {} },
+        async index => index.entriesMap.get('image.bin').stages
+      )
+      const blob = async oid =>
+        (await readBlob({ fs, gitdir, oid, filepath: 'image.bin' })).oid
+      expect(index.slice(1).map(entry => entry.oid)).toEqual([
+        await blob(baseOid),
+        await blob(masterOid),
+        await blob(featureOid),
+      ])
+
+      // The text file merged cleanly, byte for byte.
+      expect(Array.from(await fs.read(`${dir}/latin1.txt`))).toEqual(
+        Array.from(latin1.merged)
+      )
+      expect(await status({ fs, dir, gitdir, filepath: 'latin1.txt' })).toBe(
+        'modified'
+      )
+    })
   })
 })

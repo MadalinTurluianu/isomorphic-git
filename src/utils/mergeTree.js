@@ -9,6 +9,7 @@ import { GitTree } from '../models/GitTree.js'
 import { _writeObject as writeObject } from '../storage/writeObject.js'
 
 import { basename } from './basename.js'
+import { isBinary } from './isBinary.js'
 import { join } from './join.js'
 import { mergeFile } from './mergeFile.js'
 import { modified } from './modified.js'
@@ -358,11 +359,11 @@ async function mergeBlobs({
   // Since there are ONLY two valid blob modes ('100755' and '100644') it boils down to this
   let baseMode = '100755'
   let baseOid = ''
-  let baseContent = ''
+  let baseContent = new Uint8Array()
   if (base && (await base.type()) === 'blob') {
     baseMode = await base.mode()
     baseOid = await base.oid()
-    baseContent = Buffer.from(await base.content()).toString('utf8')
+    baseContent = await base.content()
   }
   const mode =
     baseMode === (await ours.mode()) ? await theirs.mode() : await ours.mode()
@@ -387,18 +388,33 @@ async function mergeBlobs({
     }
   }
   // if both sides made changes do a merge
-  const ourContent = Buffer.from(await ours.content()).toString('utf8')
-  const theirContent = Buffer.from(await theirs.content()).toString('utf8')
+  const ourContent = await ours.content()
+  const theirContent = await theirs.content()
+  // Like git, never merge binary files: ours stays in the working tree and
+  // all three versions are recorded in the index.
+  if ([baseContent, ourContent, theirContent].some(isBinary)) {
+    return {
+      cleanMerge: false,
+      mergeResult: { mode, path, oid: await ours.oid(), type },
+    }
+  }
+  // The built-in driver merges bytes like git, so text in any encoding comes
+  // out unchanged. Custom drivers are given text, as documented.
+  const encoding = mergeDriver === mergeFile ? 'latin1' : 'utf8'
+  const label = s =>
+    encoding === 'latin1' ? Buffer.from(s, 'utf8').toString('latin1') : s
   const { mergedText, cleanMerge } = await mergeDriver({
-    branches: [baseName, ourName, theirName],
-    contents: [baseContent, ourContent, theirContent],
+    branches: [label(baseName), label(ourName), label(theirName)],
+    contents: [baseContent, ourContent, theirContent].map(c =>
+      Buffer.from(c).toString(encoding)
+    ),
     path,
   })
   const oid = await writeObject({
     fs,
     gitdir,
     type: 'blob',
-    object: Buffer.from(mergedText, 'utf8'),
+    object: Buffer.from(mergedText, encoding),
     dryRun,
   })
 

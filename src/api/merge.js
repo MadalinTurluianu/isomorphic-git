@@ -38,6 +38,7 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
  *
  * When `abortOnConflict` is set to `false`, and a merge conflict cannot be automatically resolved, a `MergeConflictError` is thrown and the results of the incomplete merge will be written to the working directory.
  * This includes conflict markers in files with unresolved merge conflicts.
+ * Binary files are never merged: ours is kept in the working directory and the conflict is recorded in the index.
  *
  * To complete the merge, edit the conflicting files as you see fit, and then add and commit the resolved merge.
  *
