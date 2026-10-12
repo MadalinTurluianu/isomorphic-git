@@ -43,6 +43,7 @@ describe('merge', () => {
     }
     expect(error).not.toBeNull()
     expect(error.code).toBe(Errors.UnmergedPathsError.code)
+    expect(error.message).toContain(error.data.filepaths.join(', '))
   })
   it('merge master into master', async () => {
     // Setup
