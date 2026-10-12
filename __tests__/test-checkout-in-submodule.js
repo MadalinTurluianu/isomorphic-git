@@ -3,6 +3,7 @@ import * as path from 'path'
 import {
   Errors,
   checkout,
+  init,
   currentBranch,
   listFiles,
   add,
@@ -961,5 +962,47 @@ describe('checkout', () => {
       ['src/index.js', 1, 1, 1],
     ])
     expect(indexWrites).toBe(1)
+  })
+  it('checkout overwrites an untracked file that .gitignore ignores, like git', async () => {
+    for (const ignore of [true, false]) {
+      const { fs, dir, gitdir } = await makeFixtureAsSubmodule(
+        `tmp-checkout-ignored-${ignore}`
+      )
+      const author = { name: 'Git', email: 'git@example.org' }
+      await init({ fs, dir, gitdir })
+      await fs.write(`${dir}/.gitignore`, ignore ? '.local\n' : '')
+      await add({ fs, dir, gitdir, filepath: '.gitignore' })
+      await commit({ fs, dir, gitdir, author, message: 'base' })
+      await branch({ fs, dir, gitdir, ref: 'feature', checkout: true })
+      await fs.write(`${dir}/.local/folder.lock`, 'theirs\n')
+      await add({
+        fs,
+        dir,
+        gitdir,
+        filepath: '.local/folder.lock',
+        force: true,
+      })
+      await commit({ fs, dir, gitdir, author, message: 'feature' })
+      await checkout({ fs, dir, gitdir, ref: 'master' })
+      await fs.write(`${dir}/.local/folder.lock`, 'mine\n')
+
+      let error = null
+      try {
+        await checkout({ fs, dir, gitdir, ref: 'feature' })
+      } catch (e) {
+        error = e
+      }
+      if (ignore) {
+        expect(error).toBeNull()
+        expect(await fs.read(`${dir}/.local/folder.lock`, 'utf8')).toBe(
+          'theirs\n'
+        )
+      } else {
+        expect(error && error.code).toBe(Errors.CheckoutConflictError.code)
+        expect(await fs.read(`${dir}/.local/folder.lock`, 'utf8')).toBe(
+          'mine\n'
+        )
+      }
+    }
   })
 })
