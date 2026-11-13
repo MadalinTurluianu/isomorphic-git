@@ -3,13 +3,18 @@ import '../typedefs.js'
 
 import { _commit } from '../commands/commit.js'
 import { _currentBranch } from '../commands/currentBranch.js'
-import { _findMergeBase } from '../commands/findMergeBase.js'
+import { _findMergeBases } from '../commands/findMergeBase.js'
 import { FastForwardError } from '../errors/FastForwardError.js'
 import { MergeConflictError } from '../errors/MergeConflictError.js'
+import { MergeInProgressError } from '../errors/MergeInProgressError.js'
+import { MergeLocalChangesError } from '../errors/MergeLocalChangesError.js'
 import { MergeNotSupportedError } from '../errors/MergeNotSupportedError.js'
+import { UnrelatedHistoriesError } from '../errors/UnrelatedHistoriesError.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { abbreviateRef } from '../utils/abbreviateRef.js'
+import { findLocalChanges } from '../utils/findLocalChanges.js'
+import { formatMergeMessage, mergeInProgress } from '../utils/mergeState.js'
 import { mergeTree } from '../utils/mergeTree.js'
 import { resolveCommit } from '../utils/resolveCommit.js'
 
@@ -76,9 +81,14 @@ export async function _merge({
   mergeDriver,
   allowUnrelatedHistories = false,
 }) {
-  if (ours === undefined) {
-    ours = await _currentBranch({ fs, gitdir, fullname: true })
+  // Like git, refuse to start while a merge or cherry-pick waits to be
+  // committed or aborted, so that its state is not lost.
+  if (!dryRun) {
+    const inProgress = await mergeInProgress({ fs, gitdir })
+    if (inProgress) throw new MergeInProgressError(inProgress)
   }
+  const currentBranch = await _currentBranch({ fs, gitdir, fullname: true })
+  if (ours === undefined) ours = currentBranch
   ours = await GitRefManager.expand({
     fs,
     gitdir,
@@ -102,20 +112,26 @@ export async function _merge({
     oid: await GitRefManager.resolve({ fs, gitdir, ref: theirs }),
   })
   // find most recent common ancestor of ref a and ref b
-  const baseOids = await _findMergeBase({
+  const { bases: baseOids, shallow } = await _findMergeBases({
     fs,
     cache,
     gitdir,
     oids: [ourOid, theirOid],
   })
-  if (baseOids.length !== 1) {
-    if (baseOids.length === 0 && allowUnrelatedHistories) {
-      // 4b825…  == the empty tree used by git
-      baseOids.push('4b825dc642cb6eb9a060e54bf8d69288fbee4904')
-    } else {
-      // TODO: Recursive Merge strategy
-      throw new MergeNotSupportedError()
+  if (baseOids.length === 0) {
+    if (!allowUnrelatedHistories) {
+      throw new UnrelatedHistoriesError(
+        abbreviateRef(ours),
+        abbreviateRef(theirs),
+        shallow
+      )
     }
+    // 4b825…  == the empty tree used by git
+    baseOids.push('4b825dc642cb6eb9a060e54bf8d69288fbee4904')
+  }
+  if (baseOids.length > 1) {
+    // TODO: Recursive Merge strategy
+    throw new MergeNotSupportedError('more than one merge base (criss-cross)')
   }
   const baseOid = baseOids[0]
   // handle fast-forward case
@@ -127,6 +143,7 @@ export async function _merge({
   }
   if (fastForward && baseOid === ourOid) {
     if (!dryRun && !noUpdateBranch) {
+      await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
       await GitRefManager.writeRef({ fs, gitdir, ref: ours, value: theirOid })
     }
     return {
@@ -138,11 +155,27 @@ export async function _merge({
     if (fastForwardOnly) {
       throw new FastForwardError()
     }
+    // Conflicts are written to the working tree and the index. Like git,
+    // refuse to write them over local changes. A clean merge leaves the
+    // working tree alone, so local changes do not stop it.
+    /** @type {string[]} */
+    let localChanges = []
+    if (dir && !abortOnConflict && !dryRun) {
+      localChanges = await findLocalChanges({
+        fs,
+        cache,
+        dir,
+        gitdir,
+        headTree: ourOid,
+        baseTree: baseOid,
+        theirTree: theirOid,
+      })
+    }
     // try a fancier merge
     const tree = await GitIndexManager.acquire(
       { fs, gitdir, cache, allowUnmerged: false },
       async index => {
-        return mergeTree({
+        const result = await mergeTree({
           fs,
           cache,
           dir,
@@ -151,24 +184,48 @@ export async function _merge({
           ourOid,
           theirOid,
           baseOid,
-          ourName: abbreviateRef(ours),
+          // git labels our side HEAD, which is what ours normally is
+          ourName: ours === currentBranch ? 'HEAD' : abbreviateRef(ours),
           baseName: 'base',
           theirName: abbreviateRef(theirs),
           dryRun,
-          abortOnConflict,
+          // Nothing may be written over local changes.
+          abortOnConflict: abortOnConflict || localChanges.length > 0,
           mergeDriver,
         })
+        if (result instanceof MergeConflictError && localChanges.length > 0) {
+          throw new MergeLocalChangesError(localChanges)
+        }
+        return result
       }
     )
 
+    if (!message) message = defaultMessage(ours, theirs)
+
     // Defer throwing error until the index lock is relinquished and index is
     // written to filesystem
-    if (tree instanceof MergeConflictError) throw tree
+    if (tree instanceof MergeConflictError) {
+      // Record the merge in progress the way git does, so `commit` (or
+      // `git commit`) finishes it and `abortMerge` can undo it. Only for the
+      // checked-out branch: the next commit would land there.
+      if (
+        dir &&
+        !abortOnConflict &&
+        !dryRun &&
+        (ours === currentBranch || ours === 'HEAD')
+      ) {
+        await fs.write(`${gitdir}/MERGE_HEAD`, `${theirOid}\n`)
+        await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
+        await fs.write(
+          `${gitdir}/MERGE_MSG`,
+          formatMergeMessage(message, tree.data.filepaths)
+        )
+      }
+      throw tree
+    }
 
-    if (!message) {
-      message = `Merge branch '${abbreviateRef(theirs)}' into ${abbreviateRef(
-        ours
-      )}`
+    if (!dryRun && !noUpdateBranch) {
+      await writeOrigHead({ fs, gitdir, ours, oid: ourOid })
     }
     const oid = await _commit({
       fs,
@@ -190,5 +247,27 @@ export async function _merge({
       tree,
       mergeCommit: true,
     }
+  }
+}
+
+// The title git gives a merge commit: "into <branch>" is left out when
+// merging into main or master.
+function defaultMessage(ours, theirs) {
+  const kind = theirs.startsWith('refs/tags/')
+    ? 'tag'
+    : theirs.startsWith('refs/remotes/')
+      ? 'remote-tracking branch'
+      : 'branch'
+  const into = ['main', 'master'].includes(abbreviateRef(ours))
+    ? ''
+    : ` into ${abbreviateRef(ours)}`
+  return `Merge ${kind} '${abbreviateRef(theirs)}'${into}`
+}
+
+// Like git, remember where the checked-out branch was before a merge moves
+// it, so that `git reset --hard ORIG_HEAD` undoes the merge.
+async function writeOrigHead({ fs, gitdir, ours, oid }) {
+  if (ours === (await _currentBranch({ fs, gitdir, fullname: true }))) {
+    await fs.write(`${gitdir}/ORIG_HEAD`, `${oid}\n`)
   }
 }

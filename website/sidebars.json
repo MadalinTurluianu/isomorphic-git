@@ -13,6 +13,10 @@
       "fastForward",
       "merge",
       "abortMerge",
+      "listUnmergedFiles",
+      "rebase",
+      "continueRebase",
+      "abortRebase",
       "walk",
       "stash"
     ],
@@ -96,6 +100,6 @@
       "cli",
       "cache"
     ],
-    "More": ["faq", "snippets", "webworker"]
+    "More": ["faq", "snippets", "webworker", "browser-file-system-access"]
   }
 }
